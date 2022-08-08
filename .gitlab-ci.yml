@@ -1,0 +1,110 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  IOT_SOLUTION_PATH: "$CI_PROJECT_DIR"
+
+before_script:
+  # add gitlab ssh key
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - echo -n $GITLAB_KEY > ~/.ssh/id_rsa_base64
+  - base64 --decode --ignore-garbage ~/.ssh/id_rsa_base64 > ~/.ssh/id_rsa
+  - chmod 600 ~/.ssh/id_rsa
+  - echo -e "Host gitlab.espressif.cn\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+  - git --version
+  - git submodule update --init --recursive
+
+.build_template: &build_template
+  stage: build
+  image: espressif/idf:release-v4.3
+  tags:
+    - build
+  variables:
+    BATCH_BUILD: "1"
+    V: "0"
+
+.build_examples_template: &build_examples_template
+  <<: *build_template
+  artifacts:
+    when: always
+    paths:
+      - $BUILD_PATH/*/*/build/*.bin
+      - $BUILD_PATH/*/*/build/*.elf
+      - $BUILD_PATH/*/*/build/*.map
+      - $BUILD_PATH/*/*/build/download.config
+      - $BUILD_PATH/*/*/build/bootloader/*.bin
+      - $LOG_PATH
+    expire_in: 1 week
+  variables:
+    IDF_CI_BUILD: "1"
+    LOG_PATH: "$CI_PROJECT_DIR/log_examples"
+    BUILD_PATH: "$CI_PROJECT_DIR/build_examples"
+  script:
+    # it's not possible to build 100% out-of-tree and have the "artifacts"
+    # mechanism work, but this is the next best thing
+    - rm -rf ${BUILD_PATH}
+    - mkdir ${BUILD_PATH}
+    - mkdir -p ${LOG_PATH}
+    # build some of examples
+    - ${IOT_SOLUTION_PATH}/tools/ci/build_examples.sh "${CI_JOB_NAME}"
+
+build_examples_00:
+  <<: *build_examples_template
+
+build_docs:
+  stage: build
+  image: $CI_DOCKER_REGISTRY/esp-idf-doc-env:v7
+  tags:
+    - build_docs
+  artifacts:
+    when: always
+    paths:
+      # English version of documentation
+      - docs/en/doxygen-warning-log.txt
+      - docs/en/sphinx-warning-log.txt
+      - docs/en/sphinx-warning-log-sanitized.txt
+      - docs/en/_build/html
+      # Chinese version of documentation
+      - docs/zh_CN/doxygen-warning-log.txt
+      - docs/zh_CN/sphinx-warning-log.txt
+      - docs/zh_CN/sphinx-warning-log-sanitized.txt
+      - docs/zh_CN/_build/html
+    expire_in: 1 mos
+  script:
+    - source /opt/pyenv/activate && pyenv global 3.6.10
+    - /opt/pyenv/pyenv-1.2.16/versions/3.6.10/bin/python -m pip install --user -r docs/requirements.txt
+    - cd docs
+    - ./check_lang_folder_sync.sh
+    - cd en
+    - make gh-linkcheck
+    - make html
+    - ../check_doc_warnings.sh
+    - cd ../zh_CN
+    - make gh-linkcheck
+    - make html
+    - ../check_doc_warnings.sh
+
+push_to_github:
+  stage: deploy
+  only:
+    - master
+    - /^release\/v/
+    - usb/add_usb_solutions
+#  when: on_success
+  image: $CI_DOCKER_REGISTRY/esp32-ci-env
+  variables:
+    GIT_STRATEGY: clone
+  before_script:
+    - echo "skip default before_script"
+  script:
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -n $GH_PUSH_KEY > ~/.ssh/id_rsa_base64
+    - base64 --decode --ignore-garbage ~/.ssh/id_rsa_base64 > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - echo -e "Host github.com\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+    - git remote remove github &>/dev/null || true
+    - git remote add github git@github.com:espressif/esp-iot-solution.git
+    - ${IOT_SOLUTION_PATH}/tools/ci/push_to_github.sh
